@@ -9,6 +9,7 @@ from transformers import (
     Trainer,
     DataCollatorForSeq2Seq
 )
+from peft import LoraConfig, get_peft_model, TaskType
 from datasets import Dataset
 from data_loader import load_alpaca_zh_dataset
 import json
@@ -48,6 +49,20 @@ class Qwen3Trainer:
             use_cache=False  # 用于梯度检查点
         )
         
+        # 设置LoRA配置
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=8,  # LoRA秩
+            lora_alpha=32,  # LoRA alpha
+            lora_dropout=0.1,  # LoRA dropout
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        )
+        
+        # 应用LoRA
+        self.model = get_peft_model(self.model, lora_config)
+        self.model.print_trainable_parameters()
+        
         # 启用梯度检查点以节省显存
         self.model.gradient_checkpointing_enable()
         
@@ -61,7 +76,7 @@ class Qwen3Trainer:
         
         texts = []
         for instruction, input_text, output in zip(instructions, inputs, outputs):
-            if input_text:
+            if input_text and input_text.strip():
                 text = f"<|im_start|>user\n{instruction}\n{input_text}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>"
             else:
                 text = f"<|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n{output}<|im_end|>"
@@ -73,7 +88,8 @@ class Qwen3Trainer:
             truncation=True,
             max_length=2048,
             padding=False,
-            return_tensors=None
+            return_tensors=None,
+            add_special_tokens=True
         )
         
         # 对于因果语言模型，labels就是input_ids
@@ -101,9 +117,9 @@ class Qwen3Trainer:
             
             # 训练参数
             num_train_epochs=3,
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=8,
-            learning_rate=2e-5,
+            per_device_train_batch_size=4,  # 使用LoRA后可以增大batch size
+            gradient_accumulation_steps=4,
+            learning_rate=1e-4,  # LoRA通常使用更高的学习率
             weight_decay=0.01,
             warmup_ratio=0.03,
             
@@ -124,18 +140,16 @@ class Qwen3Trainer:
             fp16=True,
             
             # 报告设置
-            report_to=["tensorboard", "wandb"],
+            report_to=["tensorboard"],
             
             # 其他
             dataloader_pin_memory=False,
             remove_unused_columns=False,
+            ddp_find_unused_parameters=False,
         )
     
     def train(self, dataset):
         """开始训练"""
-        # 初始化W&B
-        wandb.init(project="qwen3-1.7b-sft", name="qwen3_finetuning")
-        
         # 准备数据
         train_dataset = self.prepare_dataset(dataset)
         
@@ -165,6 +179,9 @@ class Qwen3Trainer:
         
         # 保存最终模型
         trainer.save_model()
+        self.tokenizer.save_pretrained(self.output_dir)
+        
+        # 保存训练状态
         trainer.save_state()
         
         # 记录最终指标
@@ -172,11 +189,14 @@ class Qwen3Trainer:
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         
+        # 保存LoRA适配器
+        self.model.save_pretrained(os.path.join(self.output_dir, "lora_adapter"))
+        
         return metrics
 
 def main():
     # 配置路径
-    model_path = "/mnt/ssd2/models/Qwen3-1.7B"
+    model_path = "/mnt/ssd2/models/Qwen3-1.7B"  # 确保这是本地路径
     output_dir = "/home/silverbullet/develop/project/sft/output"
     log_dir = "/home/silverbullet/develop/project/sft/logs"
     
@@ -195,11 +215,12 @@ def main():
     # 可以选择只使用部分数据用于测试
     # dataset = dataset.select(range(1000))
     
-    print(f"Dataset size: {len(dataset)}")
+    # print(f"Dataset size: {len(dataset)}")
+    # print(f"Dataset columns: {dataset.column_names}")
     
-    # 开始训练
-    metrics = trainer.train(dataset)
-    print(f"Training completed! Metrics: {metrics}")
+    # # 开始训练
+    # metrics = trainer.train(dataset)
+    # print(f"Training completed! Metrics: {metrics}")
 
 if __name__ == "__main__":
     main()
